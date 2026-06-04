@@ -11,6 +11,7 @@ crossterm = "0.29.0"
 objc2 = "0.6.4"
 objc2-core-audio = "0.3.2"
 objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFDictionary", "CFNumber", "CFString"] }
 objc2-foundation = "0.3.2"
 ratatui = "0.30.0"
 ringbuf = "0.5.0"
