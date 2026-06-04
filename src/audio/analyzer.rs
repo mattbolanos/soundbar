@@ -93,22 +93,85 @@ fn analyze_frame(
 
     let usable_bins = len / 2;
     let spectrum_len = spectrum.len();
+    let mut bands = vec![0.0_f32; spectrum_len];
     for (index, slot) in spectrum.iter_mut().enumerate() {
-        let start = index * usable_bins / spectrum_len;
-        let end = ((index + 1) * usable_bins / spectrum_len).max(start + 1);
+        let start = log_band_index(index, spectrum_len, usable_bins);
+        let end = log_band_index(index + 1, spectrum_len, usable_bins).max(start + 1);
         let magnitude = complex[start..end]
             .iter()
             .map(|sample| sample.norm())
             .sum::<f32>()
             / (end - start) as f32;
 
-        *slot = (magnitude.log10().max(-3.0) + 3.0) / 3.0;
+        *slot = ((magnitude.log10().max(-3.0) + 3.0) / 3.0).clamp(0.0, 1.0);
     }
+
+    shape_spectrum(spectrum, &mut bands);
+    spectrum.copy_from_slice(&bands);
 
     let waveform_len = waveform.len();
     for (index, slot) in waveform.iter_mut().enumerate() {
         let source_index = index * input.len() / waveform_len;
         *slot = input[source_index].clamp(-1.0, 1.0);
+    }
+}
+
+fn log_band_index(index: usize, band_count: usize, usable_bins: usize) -> usize {
+    let min_bin = 1.0_f32;
+    let max_bin = (usable_bins.saturating_sub(1)).max(1) as f32;
+    let position = index as f32 / band_count.max(1) as f32;
+
+    (min_bin * (max_bin / min_bin).powf(position))
+        .round()
+        .clamp(min_bin, max_bin) as usize
+}
+
+fn shape_spectrum(spectrum: &[f32], shaped: &mut [f32]) {
+    const KERNEL: &[(isize, f32)] = &[
+        (-3, 0.03),
+        (-2, 0.08),
+        (-1, 0.18),
+        (0, 0.42),
+        (1, 0.18),
+        (2, 0.08),
+        (3, 0.03),
+    ];
+
+    for index in 0..spectrum.len() {
+        let mut total = 0.0;
+        let mut weight = 0.0;
+
+        for &(offset, amount) in KERNEL {
+            let neighbor = (index as isize + offset)
+                .clamp(0, spectrum.len().saturating_sub(1) as isize)
+                as usize;
+            total += spectrum[neighbor] * amount;
+            weight += amount;
+        }
+
+        shaped[index] = (total / weight).powf(0.78).clamp(0.0, 1.0);
+    }
+
+    for index in 1..spectrum.len().saturating_sub(1) {
+        let left = shaped[index - 1];
+        let center = shaped[index];
+        let right = shaped[index + 1];
+        let valley = ((left + right) * 0.5 - center).max(0.0);
+        shaped[index] = (center + valley * 0.34).clamp(0.0, 1.0);
+    }
+
+    let previous = shaped.to_vec();
+    for index in 0..previous.len() {
+        let left_peak = previous[index.saturating_sub(5)..=index]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
+        let right_peak = previous[index..(index + 6).min(previous.len())]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
+        let bridge = left_peak.min(right_peak) * 0.7;
+        shaped[index] = previous[index].max(previous[index] * 0.78 + bridge * 0.22);
     }
 }
 
