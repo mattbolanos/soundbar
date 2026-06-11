@@ -2,6 +2,7 @@ mod audio;
 mod cli;
 #[cfg(target_os = "macos")]
 mod macos;
+mod now_playing;
 mod visualizer;
 
 use std::sync::{Arc, RwLock};
@@ -38,14 +39,20 @@ fn run_viz() -> Result<()> {
     {
         let running = Arc::new(AtomicBool::new(true));
         let state = Arc::new(RwLock::new(VisualState::silence()));
+        let now_playing = Arc::new(RwLock::new(None));
         let (producer, consumer) = AudioRing::new(48_000 * 4).split();
 
         let analyzer = spawn_analyzer(consumer, Arc::clone(&state), Arc::clone(&running));
+        let media = macos::now_playing::spawn_monitor(
+            Arc::clone(&now_playing),
+            Arc::clone(&running),
+        );
         let _capture = macos::capture::Capture::start(producer, Arc::clone(&running))?;
 
-        let render_result = visualizer::terminal::run(state, Arc::clone(&running));
+        let render_result = visualizer::terminal::run(state, now_playing, Arc::clone(&running));
         running.store(false, Ordering::Release);
         let _ = analyzer.join();
+        let _ = media.join();
 
         render_result
     }

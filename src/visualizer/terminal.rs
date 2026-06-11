@@ -17,8 +17,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
 use crate::audio::analyzer::VisualState;
+use crate::now_playing::NowPlaying;
 
-pub fn run(state: Arc<RwLock<VisualState>>, running: Arc<AtomicBool>) -> Result<()> {
+pub fn run(
+    state: Arc<RwLock<VisualState>>,
+    now_playing: Arc<RwLock<Option<NowPlaying>>>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -27,7 +32,7 @@ pub fn run(state: Arc<RwLock<VisualState>>, running: Arc<AtomicBool>) -> Result<
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, state, running.clone());
+    let result = run_loop(&mut terminal, state, now_playing, running.clone());
 
     running.store(false, Ordering::Release);
     disable_raw_mode()?;
@@ -40,6 +45,7 @@ pub fn run(state: Arc<RwLock<VisualState>>, running: Arc<AtomicBool>) -> Result<
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: Arc<RwLock<VisualState>>,
+    now_playing: Arc<RwLock<Option<NowPlaying>>>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
@@ -49,6 +55,7 @@ fn run_loop(
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_else(|_| VisualState::silence());
+        let media = now_playing.read().ok().and_then(|guard| guard.clone());
 
         terminal.draw(|frame| {
             let chunks = Layout::default()
@@ -59,18 +66,8 @@ fn run_loop(
                 ])
                 .split(frame.area());
 
-            let title = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "soundbar",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("system audio", Style::default().fg(Color::Magenta)),
-                Span::raw("  q to quit"),
-            ]))
-            .block(Block::default().borders(Borders::BOTTOM));
+            let title = Paragraph::new(header_line(media.as_ref(), chunks[0].width))
+                .block(Block::default().borders(Borders::BOTTOM));
             frame.render_widget(title, chunks[0]);
 
             let spectrum = Paragraph::new(render_spectrum(
@@ -95,6 +92,55 @@ fn run_loop(
     }
 
     Ok(())
+}
+
+fn header_line(now_playing: Option<&NowPlaying>, width: u16) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            "soundbar",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("system audio", Style::default().fg(Color::Magenta)),
+    ];
+
+    if let Some(now_playing) = now_playing {
+        let label = media_label(now_playing);
+        if !label.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
+        }
+    }
+
+    let used_width = spans.iter().map(|span| span.content.chars().count()).sum::<usize>();
+    if width as usize > used_width + 12 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("q to quit", Style::default().fg(Color::DarkGray)));
+    }
+
+    Line::from(spans)
+}
+
+fn media_label(now_playing: &NowPlaying) -> String {
+    let status = if now_playing.playing { ">" } else { "||" };
+    let track = match (&now_playing.title, &now_playing.artist) {
+        (Some(title), Some(artist)) => format!("{title} - {artist}"),
+        (Some(title), None) => title.clone(),
+        (None, Some(artist)) => artist.clone(),
+        (None, None) => now_playing
+            .album
+            .clone()
+            .or_else(|| now_playing.app.clone())
+            .unwrap_or_default(),
+    };
+
+    if track.is_empty() {
+        String::new()
+    } else {
+        format!("{status} {track}")
+    }
 }
 
 fn render_spectrum(values: &[f32], height: u16, width: u16) -> Text<'static> {
@@ -137,6 +183,7 @@ fn resample_spectrum(values: &[f32], width: usize) -> Vec<f32> {
     }
 
     soften_columns(&mut resampled);
+    balance_valleys(&mut resampled);
     resampled
 }
 
@@ -156,6 +203,37 @@ fn soften_columns(values: &mut [f32]) {
         let right = previous.get(index + 1).copied().unwrap_or(center);
         let bridged = center.max((left + right) * 0.38);
         values[index] = (bridged * 0.72 + center * 0.28).clamp(0.0, 1.0);
+    }
+}
+
+fn balance_valleys(values: &mut [f32]) {
+    if values.len() < 5 {
+        return;
+    }
+
+    let previous = values.to_vec();
+    let radius = (values.len() / 10).clamp(6, 24);
+
+    for index in 0..values.len() {
+        let center = previous[index];
+        let left_peak = previous[index.saturating_sub(radius)..=index]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
+        let right_peak = previous[index..=(index + radius).min(previous.len() - 1)]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
+        let local_floor = left_peak.min(right_peak);
+
+        if local_floor <= 0.08 {
+            continue;
+        }
+
+        let bridge = (local_floor * 0.54).min(center + 0.24);
+        values[index] = center
+            .max(center + (bridge - center).max(0.0) * 0.42)
+            .clamp(0.0, 1.0);
     }
 }
 
@@ -198,4 +276,38 @@ fn magma_color(position: f32) -> Color {
         lerp(from.1, to.1) as u8,
         lerp(from.2, to.2) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::balance_valleys;
+
+    #[test]
+    fn balancing_softens_local_valleys_between_peaks() {
+        let mut values = vec![0.0; 80];
+        values[24] = 0.68;
+        values[25] = 0.64;
+        values[40] = 0.61;
+        values[41] = 0.66;
+
+        balance_valleys(&mut values);
+
+        assert!(values[32] > 0.08);
+    }
+
+    #[test]
+    fn balancing_does_not_lift_a_quiet_tail_without_a_right_peak() {
+        let mut values = vec![0.0; 80];
+        values[10] = 0.7;
+        values[11] = 0.65;
+        values[18] = 0.08;
+        values[24] = 0.04;
+
+        balance_valleys(&mut values);
+
+        let tail = &values[50..70];
+        let max_tail = tail.iter().copied().fold(0.0_f32, f32::max);
+
+        assert!(max_tail < 0.08);
+    }
 }
